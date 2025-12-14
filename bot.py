@@ -22,6 +22,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger("video_downloader_bot")
 
+
+class _RedactTelegramBotTokenFilter(logging.Filter):
+    _token_re = re.compile(r"bot\d+:[A-Za-z0-9_-]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+
+        msg = self._token_re.sub("bot<BOT_TOKEN>", msg)
+        record.msg = msg
+        record.args = ()
+        return True
+
+
+for handler in logging.getLogger().handlers:
+    handler.addFilter(_RedactTelegramBotTokenFilter())
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -76,6 +95,10 @@ def _download_video_sync(url: str, tmpdir: str) -> Tuple[str, str]:
         "quiet": True,
         "no_warnings": True,
     }
+
+    proxy = os.getenv("YTDLP_PROXY")
+    if proxy:
+        ydl_opts["proxy"] = proxy
 
     cookiefile_path = os.getenv("YTDLP_COOKIEFILE")
     cookies_b64 = os.getenv("YTDLP_COOKIES_B64")
@@ -151,6 +174,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     ) from e
 
                 msg_l = msg.lower()
+                if "instagram" in msg_l and ("http error 429" in msg_l or "too many requests" in msg_l):
+                    raise ValueError(
+                        "Instagram тимчасово лімітує запити (HTTP 429 Too Many Requests). Спробуй пізніше. Для стабільності зазвичай потрібні cookies (`YTDLP_COOKIES_B64`) і/або proxy (`YTDLP_PROXY`)."
+                    ) from e
                 if "instagram" in msg_l and (
                     "login required" in msg_l
                     or "rate-limit" in msg_l
