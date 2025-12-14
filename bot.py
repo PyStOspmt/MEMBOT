@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import logging
 import os
 import re
@@ -19,6 +21,9 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 logger = logging.getLogger("video_downloader_bot")
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 MAX_FILESIZE_MB = int(os.getenv("MAX_FILESIZE_MB", "49"))
 MAX_FILESIZE_BYTES = MAX_FILESIZE_MB * 1024 * 1024
@@ -72,6 +77,25 @@ def _download_video_sync(url: str, tmpdir: str) -> Tuple[str, str]:
         "no_warnings": True,
     }
 
+    cookiefile_path = os.getenv("YTDLP_COOKIEFILE")
+    cookies_b64 = os.getenv("YTDLP_COOKIES_B64")
+
+    if cookiefile_path:
+        ydl_opts["cookiefile"] = cookiefile_path
+    elif cookies_b64:
+        cookie_path = os.path.join(tmpdir, "cookies.txt")
+        try:
+            decoded = base64.b64decode(re.sub(r"\s+", "", cookies_b64))
+        except binascii.Error as e:
+            raise ValueError(
+                "Invalid YTDLP_COOKIES_B64 env var (must be base64-encoded cookies.txt)"
+            ) from e
+
+        with open(cookie_path, "wb") as f:
+            f.write(decoded)
+
+        ydl_opts["cookiefile"] = cookie_path
+
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
 
@@ -124,6 +148,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 if "max-filesize" in msg or "max-filesize" in repr(e):
                     raise ValueError(
                         f"Відео занадто велике (ліміт {MAX_FILESIZE_MB}MB). Спробуй коротше/меншу якість."
+                    ) from e
+
+                msg_l = msg.lower()
+                if "instagram" in msg_l and (
+                    "login required" in msg_l
+                    or "rate-limit" in msg_l
+                    or "cookies" in msg_l
+                    or "requested content is not available" in msg_l
+                ):
+                    raise ValueError(
+                        "Instagram часто вимагає логін/cookies. Додай в Render env `YTDLP_COOKIES_B64` (base64 з cookies.txt) або `YTDLP_COOKIEFILE`."
                     ) from e
                 raise
 
