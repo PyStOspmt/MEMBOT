@@ -45,8 +45,8 @@ URL_REGEX = re.compile(r"(https?://\S+)", re.IGNORECASE)
 
 # Domains that Telegram can natively embed video via community proxies
 PROXY_DOMAINS = {
-    "instagram.com": "ddinstagram.com",
-    "www.instagram.com": "ddinstagram.com",
+    "instagram.com": "vxinstagram.com",
+    "www.instagram.com": "vxinstagram.com",
     "tiktok.com": "vxtiktok.com",
     "www.tiktok.com": "vxtiktok.com",
     "vm.tiktok.com": "vm.vxtiktok.com",
