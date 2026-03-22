@@ -1,0 +1,15 @@
+app = "membot"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # Тут можна задати не секретні змінні, якщо треба
+  # Секретні змінні (BOT_TOKEN, YTDLP_COOKIES_B64) додавай через сайт Fly.io або команду: flyctl secrets set BOT_TOKEN="твій_токен"
+  MAX_FILESIZE_MB = "49"
+
+# УВАГА: Ми ВИНЕСЛИ (або закоментували) секцію [http_service] / [[services]]
+# Тому що цей бот використовує Long-Polling, а не Webhooks.
+# Якщо лишити http_service, Fly.io буде чекати, що бот відкриє веб-сервер на 8080 порту,
+# і оскільки бот цього не робить, Fly.io буде його постійно перезапускати (Fail Healthcheck).
