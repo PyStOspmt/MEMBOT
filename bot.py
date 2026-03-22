@@ -182,19 +182,91 @@ def _download_media_with_opts(url: str, tmpdir: str, format_opts: dict) -> Tuple
 
     return _pick_downloaded_file(tmpdir), title, media_type
 
-def _get_instagram_direct_mp4(url: str) -> Optional[str]:
+def _clean_instagram_url(url: str) -> str:
+    """Очищує Instagram URL від трекінг-параметрів (igsh тощо) і www."""
+    parsed = urllib.parse.urlparse(url)
+    # Прибираємо всі query-параметри (igsh, utm_source і т.д.)
+    clean = parsed._replace(query="", fragment="")
+    return urllib.parse.urlunparse(clean)
+
+
+# Список проксі-сервісів для Instagram (пробуємо по черзі)
+INSTAGRAM_PROXIES = ["vxinstagram.com", "instagramez.com"]
+
+
+def _get_instagram_direct_media(url: str) -> Optional[Tuple[str, str]]:
+    """
+    Повертає (direct_url, media_type) або None.
+    media_type: "video" або "photo"
+    Пробує декілька проксі-сервісів по черзі.
+    """
     import urllib.request
-    try:
-        # Замінюємо на безпечний proxy-домен для отримання html
-        proxy_url = url.replace("instagram.com", "vxinstagram.com")
-        req = urllib.request.Request(proxy_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-        res = urllib.request.urlopen(req, timeout=15).read().decode('utf-8')
-        m = re.search(r'property="og:video" content="([^"]+)"', res)
-        if m:
-            return m.group(1).replace('&amp;', '&')
-    except Exception as e:
-        logger.error(f"Failed to extract IG mp4: {e}")
+
+    clean_url = _clean_instagram_url(url)
+    parsed = urllib.parse.urlparse(clean_url)
+    # Дістаємо чистий шлях (наприклад /p/DTQYJhXjLlP/ або /reel/DNDxqF0s2Qe/)
+    path = parsed.path
+
+    for proxy_domain in INSTAGRAM_PROXIES:
+        proxy_url = f"https://{proxy_domain}{path}"
+        logger.info(f"Trying IG proxy: {proxy_url}")
+        try:
+            req = urllib.request.Request(proxy_url, headers={
+                'User-Agent': 'Mozilla/5.0 (compatible; Telegram Bot)'
+            })
+            res = urllib.request.urlopen(req, timeout=15).read().decode('utf-8')
+
+            # Шукаємо відео
+            m_video = re.search(r'property="og:video"\s+content="([^"]+)"', res)
+            if m_video:
+                direct = m_video.group(1).replace('&amp;', '&')
+                logger.info(f"Found video URL from {proxy_domain}")
+                return direct, "video"
+
+            # Шукаємо фото
+            m_photo = re.search(r'property="og:image"\s+content="([^"]+)"', res)
+            if m_photo:
+                direct = m_photo.group(1).replace('&amp;', '&')
+                logger.info(f"Found photo URL from {proxy_domain}")
+                return direct, "photo"
+
+        except Exception as e:
+            logger.warning(f"IG proxy {proxy_domain} failed: {e}")
+            continue
+
     return None
+
+
+def _download_url_to_file(url: str, tmpdir: str) -> str:
+    """Завантажує файл з URL у tmpdir і повертає шлях."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={
+        'User-Agent': 'Mozilla/5.0 (compatible; Telegram Bot)'
+    })
+    resp = urllib.request.urlopen(req, timeout=60)
+
+    # Визначаємо розширення за Content-Type
+    ct = resp.headers.get('Content-Type', '')
+    if 'video' in ct:
+        ext = '.mp4'
+    elif 'jpeg' in ct or 'jpg' in ct:
+        ext = '.jpg'
+    elif 'png' in ct:
+        ext = '.png'
+    elif 'webp' in ct:
+        ext = '.webp'
+    else:
+        ext = '.mp4'  # За замовчуванням відео
+
+    filepath = os.path.join(tmpdir, f"ig_media{ext}")
+    with open(filepath, 'wb') as f:
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            f.write(chunk)
+    return filepath
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
@@ -204,26 +276,61 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Я завантажу файлом одразу в чат!"
     )
 
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if not message: return
     url = _extract_url_from_message(update)
     if not url: return
 
-    status_msg = await message.reply_text("📥 Завантажую відео (це може зайняти час)...")
+    status_msg = await message.reply_text("📥 Завантажую відео...")
 
-    # Спеціальна логіка для Instagram (обхід авторизації)
+    # ── Спеціальна логіка для Instagram ──
     if "instagram.com" in url:
-        direct_url = await asyncio.to_thread(_get_instagram_direct_mp4, url)
-        if direct_url:
-            try:
-                # Відправляємо відео безпосередньо в Телеграм за прямим посиланням
-                await message.reply_video(video=direct_url, supports_streaming=True)
-                await status_msg.delete()
-                return
-            except Exception as e:
-                logger.error(f"Telegram URL upload failed, falling back to yt-dlp: {e}")
+        try:
+            result = await asyncio.to_thread(_get_instagram_direct_media, url)
+            if result:
+                direct_url, media_type = result
 
+                # Спроба 1: відправити по URL напряму (швидко, без скачування)
+                try:
+                    if media_type == "video":
+                        await message.reply_video(video=direct_url, supports_streaming=True)
+                    else:
+                        await message.reply_photo(photo=direct_url)
+                    try: await status_msg.delete()
+                    except: pass
+                    return
+                except Exception as e:
+                    logger.warning(f"Direct URL send failed, downloading file: {e}")
+
+                # Спроба 2: скачуємо файл собі і потім відправляємо
+                with tempfile.TemporaryDirectory(prefix="ig_") as tmpdir:
+                    filepath = await asyncio.to_thread(_download_url_to_file, direct_url, tmpdir)
+                    size = os.path.getsize(filepath)
+                    if size > MAX_FILESIZE_BYTES:
+                        raise ValueError(f"Файл завеликий ({size // 1024 // 1024}MB). Ліміт {MAX_FILESIZE_MB}MB.")
+                    with open(filepath, "rb") as f:
+                        if media_type == "video":
+                            await message.reply_video(video=f, supports_streaming=True)
+                        else:
+                            await message.reply_photo(photo=f)
+                    try: await status_msg.delete()
+                    except: pass
+                    return
+            else:
+                raise ValueError(
+                    "Не вдалося отримати медіа з Instagram. "
+                    "Можливо, пост закритий або тимчасово недоступний."
+                )
+        except Exception as e:
+            logger.exception("Instagram handler failed for url=%s", url)
+            await message.reply_text(f"❌ Помилка Instagram: {e}")
+            try: await status_msg.delete()
+            except: pass
+            return
+
+    # ── Стандартна логіка для інших сайтів (YouTube, TikTok і т.д.) ──
     try:
         with tempfile.TemporaryDirectory(prefix="dl_") as tmpdir:
             try:
@@ -232,8 +339,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 msg = str(e).lower()
                 if "max-filesize" in msg:
                     raise ValueError(f"Медіа занадто велике (ліміт {MAX_FILESIZE_MB}MB).") from e
-                if "instagram" in msg and ("login required" in msg or "cookies" in msg or "429" in msg):
-                    raise ValueError("Instagram тимчасово не працює для завантаження файлом через відсутність кукі.") from e
                 raise
             size = os.path.getsize(file_path)
             if size > MAX_FILESIZE_BYTES:
