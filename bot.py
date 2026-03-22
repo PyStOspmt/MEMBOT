@@ -182,13 +182,26 @@ def _download_media_with_opts(url: str, tmpdir: str, format_opts: dict) -> Tuple
 
     return _pick_downloaded_file(tmpdir), title, media_type
 
+def _get_instagram_direct_mp4(url: str) -> Optional[str]:
+    import urllib.request
+    try:
+        # Замінюємо на безпечний proxy-домен для отримання html
+        proxy_url = url.replace("instagram.com", "vxinstagram.com")
+        req = urllib.request.Request(proxy_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+        res = urllib.request.urlopen(req, timeout=15).read().decode('utf-8')
+        m = re.search(r'property="og:video" content="([^"]+)"', res)
+        if m:
+            return m.group(1).replace('&amp;', '&')
+    except Exception as e:
+        logger.error(f"Failed to extract IG mp4: {e}")
+    return None
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if not message: return
     await message.reply_text(
         "Привіт! Надішли посилання на відео (Instagram / TikTok / YouTube / X).\n"
-        "Інстаграм, ТікТок та X(Twitter) я відкрию для тебе миттєво без обмежень. "
-        "А інше відео — завантажу файлом."
+        "Я завантажу файлом одразу в чат!"
     )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -197,21 +210,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     url = _extract_url_from_message(update)
     if not url: return
 
-    # 1. Спочатку спробуємо проксі для мікросервісів Telegram (Instagram, TikTok, Twitter)
-    proxied_url = _get_proxied_url(url)
-    if proxied_url:
-        try:
-            # Телеграм сам скачає і покаже кліп як нативне відео, просто надіславши лінк.
-            await message.reply_text(
-                f'<a href="{proxied_url}">📹 Відео готове (натисни або дивись тут):</a>\n{proxied_url}', 
-                parse_mode=ParseMode.HTML
-            )
-            return  # Зупиняємо функцію, завантажувати файл на наш сервер вже не потрібно!
-        except Exception as e:
-            logger.error(f"Error sending proxy url: {e}")
-
-    # 2. Якщо домен не підтримується через проксі (YouTube та інші) — качаємо класичними методами
     status_msg = await message.reply_text("📥 Завантажую відео (це може зайняти час)...")
+
+    # Спеціальна логіка для Instagram (обхід авторизації)
+    if "instagram.com" in url:
+        direct_url = await asyncio.to_thread(_get_instagram_direct_mp4, url)
+        if direct_url:
+            try:
+                # Відправляємо відео безпосередньо в Телеграм за прямим посиланням
+                await message.reply_video(video=direct_url, supports_streaming=True)
+                await status_msg.delete()
+                return
+            except Exception as e:
+                logger.error(f"Telegram URL upload failed, falling back to yt-dlp: {e}")
+
     try:
         with tempfile.TemporaryDirectory(prefix="dl_") as tmpdir:
             try:
@@ -221,7 +233,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 if "max-filesize" in msg:
                     raise ValueError(f"Медіа занадто велике (ліміт {MAX_FILESIZE_MB}MB).") from e
                 if "instagram" in msg and ("login required" in msg or "cookies" in msg or "429" in msg):
-                    raise ValueError("Instagram тимчасово не працює для завантаження файлом.") from e
+                    raise ValueError("Instagram тимчасово не працює для завантаження файлом через відсутність кукі.") from e
                 raise
             size = os.path.getsize(file_path)
             if size > MAX_FILESIZE_BYTES:

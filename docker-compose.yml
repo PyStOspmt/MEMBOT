@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  memebot:
+    build: .
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - MAX_FILESIZE_MB=${MAX_FILESIZE_MB:-49}
+      - YTDLP_FORMAT=${YTDLP_FORMAT:-best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best}
+      - YTDLP_PROXY=${YTDLP_PROXY:-}
+      - YTDLP_COOKIEFILE=${YTDLP_COOKIEFILE:-}
+      - YTDLP_COOKIES_B64=${YTDLP_COOKIES_B64:-}
+    volumes:
+      - ./data:/app/data
+    networks:
+      - memebot-network
+
+networks:
+  memebot-network:
+    driver: bridge
+
+volumes:
+  data:
+    driver: local
