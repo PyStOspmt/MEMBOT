@@ -80,19 +80,18 @@ def _pick_downloaded_file(tmpdir: str) -> str:
 
 def _download_media_sync(url: str, tmpdir: str) -> Tuple[str, str, str]:
     is_youtube = "youtube.com" in url or "youtu.be" in url
-    is_tiktok = "tiktok.com" in url
 
-    # Специфічні extractor_args для YouTube (обхід "Sign in to confirm")
+    # YouTube: android_vr не вимагає PO Token взагалі (обхід bot check без cookies)
+    # https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide
     yt_extractor_args = None
     if is_youtube:
         yt_extractor_args = {
             "youtube": {
-                "player_client": ["android", "web"],
+                "player_client": ["android_vr", "android", "web"],
             },
         }
 
     try:
-        # 1. Гарантований запит на злиття відео та аудіо (виправлено проблему зі звуком)
         return _download_media_with_opts(url, tmpdir, {
             "format": os.getenv(
                 "YTDLP_FORMAT",
@@ -103,11 +102,15 @@ def _download_media_sync(url: str, tmpdir: str) -> Tuple[str, str, str]:
     except DownloadError as e:
         msg_l = str(e).lower()
 
-        # YouTube "Sign in to confirm" — пробуємо інші клієнти
+        # YouTube "Sign in to confirm" — ротація клієнтів які не потребують PO Token
         if is_youtube and ("sign in" in msg_l or "not a bot" in msg_l or "no formats" in msg_l):
             logger.warning("YouTube bot check triggered, trying alternative clients")
-            for client in [["ios"], ["mweb"], ["tv_embedded"]]:
+            # android_vr: PO Token not required, no cookies needed
+            # tv_simply: PO Token for GVS only, no account support
+            # web_embedded: PO Token not required, but only embeddable videos
+            for client in [["android_vr"], ["tv_simply"], ["web_embedded"], ["ios"], ["mweb"]]:
                 try:
+                    logger.info(f"Trying YouTube client: {client}")
                     return _download_media_with_opts(url, tmpdir, {
                         "format": os.getenv("YTDLP_FORMAT", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"),
                         "extractor_args": {"youtube": {"player_client": client}},
