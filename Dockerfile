@@ -14,11 +14,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install bgutil PO Token provider (auto-generates YouTube PO Tokens without cookies)
 # Package not on npm registry — clone and build from GitHub
 RUN git clone --single-branch --branch 1.3.1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /bgutil \
-    && cd /bgutil/server && npm ci --omit=dev
+    && cd /bgutil/server && npm ci --omit=dev && npx tsc
 
 COPY . ./
 
 ENV PYTHONUNBUFFERED=1
 
 # Start bgutil PO Token server in background, then run bot
-CMD ["sh", "-c", "node /bgutil/server/src/index.js & sleep 2 && python bot.py"]
+CMD ["sh", "-c", "node /bgutil/server/build/main.js & sleep 2 && python bot.py"]

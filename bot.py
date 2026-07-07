@@ -347,6 +347,17 @@ def _download_instagram_instaloader(url: str, tmpdir: str) -> Optional[Tuple[str
         return None
 
     clean_url = _clean_instagram_url(url)
+    # Витягуємо shortcode з URL (/p/XXX/ або /reel/XXX/ або /reels/XXX/)
+    shortcode = None
+    for pattern in [r"/p/([^/]+)", r"/reel/([^/]+)", r"/reels/([^/]+)"]:
+        m = re.search(pattern, clean_url)
+        if m:
+            shortcode = m.group(1)
+            break
+    if not shortcode:
+        logger.warning(f"Could not extract shortcode from {clean_url}")
+        return None
+
     try:
         loader = Instaloader(
             download_videos=True,
@@ -358,7 +369,7 @@ def _download_instagram_instaloader(url: str, tmpdir: str) -> Optional[Tuple[str
             dirname_pattern=tmpdir,
         )
 
-        post = Post.from_url(loader, clean_url)
+        post = Post.from_shortcode(loader.context, shortcode)
         loader.download_post(post, target=tmpdir)
 
         # Знаходимо завантажений файл
@@ -451,16 +462,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                         size = os.path.getsize(file_path)
                         if size > MAX_FILESIZE_BYTES:
                             raise ValueError(f"Файл завеликий ({size // 1024 // 1024}MB). Ліміт {MAX_FILESIZE_MB}MB.")
-                        with open(file_path, "rb") as f:
-                            if media_type == "video":
-                                await message.reply_video(video=f, supports_streaming=True)
-                            elif media_type == "photo":
-                                await message.reply_photo(photo=f)
-                            else:
-                                await message.reply_document(document=f)
-                        try: await status_msg.delete()
-                        except: pass
-                        ig_handled = True
+                        # Перевіряємо наявність аудіо для відео
+                        if media_type == "video" and not _has_audio_stream(file_path):
+                            logger.warning("yt-dlp Instagram video has no audio, skipping to proxy")
+                        else:
+                            with open(file_path, "rb") as f:
+                                if media_type == "video":
+                                    await message.reply_video(video=f, supports_streaming=True)
+                                elif media_type == "photo":
+                                    await message.reply_photo(photo=f)
+                                else:
+                                    await message.reply_document(document=f)
+                            try: await status_msg.delete()
+                            except: pass
+                            ig_handled = True
                 except Exception as e:
                     logger.warning("yt-dlp failed for Instagram url=%s: %s", url, e)
 
