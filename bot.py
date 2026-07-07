@@ -1,10 +1,12 @@
 import asyncio
 import base64
 import binascii
+import json
 import logging
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 import urllib.parse
@@ -317,6 +319,21 @@ def _download_url_to_file(url: str, tmpdir: str) -> str:
     return filepath
 
 
+def _has_audio_stream(filepath: str) -> bool:
+    """Перевіряє чи файл має аудіо доріжку через ffprobe."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", filepath],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return True  # Не можемо перевірити — краще відправити
+        data = json.loads(result.stdout)
+        streams = data.get("streams", [])
+        return any(s.get("codec_type") == "audio" for s in streams)
+    except Exception:
+        return True  # Помилка перевірки — краще відправити
+
 def _download_instagram_instaloader(url: str, tmpdir: str) -> Optional[Tuple[str, str]]:
     """
     Завантажує Instagram медіа через instaloader.
@@ -406,14 +423,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     size = os.path.getsize(filepath)
                     if size > MAX_FILESIZE_BYTES:
                         raise ValueError(f"Файл завеликий ({size // 1024 // 1024}MB). Ліміт {MAX_FILESIZE_MB}MB.")
-                    with open(filepath, "rb") as f:
-                        if media_type == "video":
-                            await message.reply_video(video=f, supports_streaming=True)
-                        else:
-                            await message.reply_photo(photo=f)
-                    try: await status_msg.delete()
-                    except: pass
-                    ig_handled = True
+                    # Перевіряємо наявність аудіо для відео
+                    if media_type == "video" and not _has_audio_stream(filepath):
+                        logger.warning("instaloader video has no audio, trying next method")
+                    else:
+                        with open(filepath, "rb") as f:
+                            if media_type == "video":
+                                await message.reply_video(video=f, supports_streaming=True)
+                            else:
+                                await message.reply_photo(photo=f)
+                        try: await status_msg.delete()
+                        except: pass
+                        ig_handled = True
             except Exception as e:
                 logger.warning("instaloader failed for url=%s: %s", url, e)
             finally:
@@ -450,22 +471,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     result = await asyncio.to_thread(_get_instagram_direct_media, url)
                     if result:
                         direct_url, media_type = result
-                        try:
-                            if media_type == "video":
-                                await message.reply_video(video=direct_url, supports_streaming=True)
+                        # Для проксі завжди скачуємо файл (не відправляємо URL напряму)
+                        # щоб перевірити наявність аудіо
+                        with tempfile.TemporaryDirectory(prefix="ig_") as tmpdir:
+                            filepath = await asyncio.to_thread(_download_url_to_file, direct_url, tmpdir)
+                            size = os.path.getsize(filepath)
+                            if size > MAX_FILESIZE_BYTES:
+                                raise ValueError(f"Файл завеликий ({size // 1024 // 1024}MB). Ліміт {MAX_FILESIZE_MB}MB.")
+                            if media_type == "video" and not _has_audio_stream(filepath):
+                                logger.warning("proxy video has no audio, skipping")
                             else:
-                                await message.reply_photo(photo=direct_url)
-                            try: await status_msg.delete()
-                            except: pass
-                            ig_handled = True
-                        except Exception as e:
-                            logger.warning(f"Proxy direct URL send failed, downloading file: {e}")
-                        if not ig_handled:
-                            with tempfile.TemporaryDirectory(prefix="ig_") as tmpdir:
-                                filepath = await asyncio.to_thread(_download_url_to_file, direct_url, tmpdir)
-                                size = os.path.getsize(filepath)
-                                if size > MAX_FILESIZE_BYTES:
-                                    raise ValueError(f"Файл завеликий ({size // 1024 // 1024}MB). Ліміт {MAX_FILESIZE_MB}MB.")
                                 with open(filepath, "rb") as f:
                                     if media_type == "video":
                                         await message.reply_video(video=f, supports_streaming=True)
