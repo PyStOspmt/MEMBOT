@@ -178,8 +178,25 @@ def _clean_instagram_url(url: str) -> str:
 
 
 # Список проксі-сервісів для Instagram (пробуємо по черзі)
-# Оновлено 2026: vxinstagram archived, додано toinstagram/adamlikes (FixupXer v1.4.8)
+# УВАГА 2026: більшість проксі повертають login page замість медіа.
+# Проксі використовуються як останній резерв після instaloader/yt-dlp.
 INSTAGRAM_PROXIES = ["toinstagram.com", "adamlikes.men", "instagram7.com", "zzinstagram.com"]
+
+
+def _is_login_page(html: str) -> bool:
+    """Детектить Instagram login page у відповіді проксі."""
+    indicators = [
+        'Log into Instagram',
+        'loginForm',
+        'accounts/password/reset',
+        'accounts/emailsignup',
+    ]
+    return any(ind in html for ind in indicators)
+
+
+def _is_reel_url(url: str) -> bool:
+    """Перевіряє чи URL — це Instagram reel (відео)."""
+    return '/reel/' in url or '/reels/' in url
 
 
 def _get_instagram_direct_media(url: str) -> Optional[Tuple[str, str]]:
@@ -187,13 +204,14 @@ def _get_instagram_direct_media(url: str) -> Optional[Tuple[str, str]]:
     Повертає (direct_url, media_type) або None.
     media_type: "video" або "photo"
     Пробує декілька проксі-сервісів по черзі.
+    Пропускає login pages. Для reel приймає тільки video.
     """
     import urllib.request
 
     clean_url = _clean_instagram_url(url)
     parsed = urllib.parse.urlparse(clean_url)
-    # Дістаємо чистий шлях (наприклад /p/DTQYJhXjLlP/ або /reel/DNDxqF0s2Qe/)
     path = parsed.path
+    is_reel = '/reel/' in path or '/reels/' in path
 
     for proxy_domain in INSTAGRAM_PROXIES:
         proxy_url = f"https://{proxy_domain}{path}"
@@ -204,6 +222,11 @@ def _get_instagram_direct_media(url: str) -> Optional[Tuple[str, str]]:
             })
             res = urllib.request.urlopen(req, timeout=15).read().decode('utf-8')
 
+            # Пропускаємо login pages
+            if _is_login_page(res):
+                logger.warning(f"IG proxy {proxy_domain} returned login page, skipping")
+                continue
+
             # Шукаємо відео (різні варіанти og:video та порядок атрибутів)
             m_video = re.search(r'property="og:video(?:[:\w]*)?"\s+content="([^"]+)"', res)
             if not m_video:
@@ -213,14 +236,15 @@ def _get_instagram_direct_media(url: str) -> Optional[Tuple[str, str]]:
                 logger.info(f"Found video URL from {proxy_domain}")
                 return direct, "video"
 
-            # Шукаємо фото
-            m_photo = re.search(r'property="og:image"\s+content="([^"]+)"', res)
-            if not m_photo:
-                m_photo = re.search(r'content="([^"]+)"\s+property="og:image"', res)
-            if m_photo:
-                direct = m_photo.group(1).replace('&amp;', '&')
-                logger.info(f"Found photo URL from {proxy_domain}")
-                return direct, "photo"
+            # Шукаємо фото — але НЕ для reel (reel = відео)
+            if not is_reel:
+                m_photo = re.search(r'property="og:image"\s+content="([^"]+)"', res)
+                if not m_photo:
+                    m_photo = re.search(r'content="([^"]+)"\s+property="og:image"', res)
+                if m_photo:
+                    direct = m_photo.group(1).replace('&amp;', '&')
+                    logger.info(f"Found photo URL from {proxy_domain}")
+                    return direct, "photo"
 
         except Exception as e:
             logger.warning(f"IG proxy {proxy_domain} failed: {e}")
@@ -335,79 +359,104 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     async with _download_semaphore:
 
-        # ── Спеціальна логіка для Instagram (проксі → instaloader → yt-dlp fallback) ──
+        # ── Спеціальна логіка для Instagram (instaloader → yt-dlp → проксі) ──
         if "instagram.com" in url:
             ig_handled = False
+
+            # Спроба 1: instaloader (найнадійніший для Instagram у 2026)
+            tmpdir_il = None
             try:
-                result = await asyncio.to_thread(_get_instagram_direct_media, url)
-                if result:
-                    direct_url, media_type = result
-
-                    # Спроба 1: відправити по URL напряму (швидко, без скачування)
-                    try:
+                tmpdir_il = tempfile.mkdtemp(prefix="ig_il_")
+                il_result = await asyncio.to_thread(_download_instagram_instaloader, url, tmpdir_il)
+                if il_result:
+                    filepath, media_type = il_result
+                    size = os.path.getsize(filepath)
+                    if size > MAX_FILESIZE_BYTES:
+                        raise ValueError(f"Файл завеликий ({size // 1024 // 1024}MB). Ліміт {MAX_FILESIZE_MB}MB.")
+                    with open(filepath, "rb") as f:
                         if media_type == "video":
-                            await message.reply_video(video=direct_url, supports_streaming=True)
+                            await message.reply_video(video=f, supports_streaming=True)
                         else:
-                            await message.reply_photo(photo=direct_url)
-                        try: await status_msg.delete()
-                        except: pass
-                        ig_handled = True
-                    except Exception as e:
-                        logger.warning(f"Direct URL send failed, downloading file: {e}")
-
-                    # Спроба 2: скачуємо файл собі і потім відправляємо
-                    if not ig_handled:
-                        with tempfile.TemporaryDirectory(prefix="ig_") as tmpdir:
-                            filepath = await asyncio.to_thread(_download_url_to_file, direct_url, tmpdir)
-                            size = os.path.getsize(filepath)
-                            if size > MAX_FILESIZE_BYTES:
-                                raise ValueError(f"Файл завеликий ({size // 1024 // 1024}MB). Ліміт {MAX_FILESIZE_MB}MB.")
-                            with open(filepath, "rb") as f:
-                                if media_type == "video":
-                                    await message.reply_video(video=f, supports_streaming=True)
-                                else:
-                                    await message.reply_photo(photo=f)
-                            try: await status_msg.delete()
-                            except: pass
-                            ig_handled = True
-                else:
-                    logger.warning("All IG proxies returned no media, falling back to instaloader")
+                            await message.reply_photo(photo=f)
+                    try: await status_msg.delete()
+                    except: pass
+                    ig_handled = True
             except Exception as e:
-                logger.warning("Instagram proxy approach failed for url=%s, falling back to instaloader: %s", url, e)
+                logger.warning("instaloader failed for url=%s: %s", url, e)
+            finally:
+                if tmpdir_il:
+                    try: shutil.rmtree(tmpdir_il, ignore_errors=True)
+                    except: pass
 
-            # Спроба 3: instaloader (надійніший за yt-dlp для Instagram)
+            # Спроба 2: yt-dlp (потребує cookies для приватних постів)
             if not ig_handled:
-                tmpdir_il = None
+                logger.info("instaloader failed, trying yt-dlp for Instagram URL: %s", url)
                 try:
-                    tmpdir_il = tempfile.mkdtemp(prefix="ig_il_")
-                    il_result = await asyncio.to_thread(_download_instagram_instaloader, url, tmpdir_il)
-                    if il_result:
-                        filepath, media_type = il_result
-                        size = os.path.getsize(filepath)
+                    with tempfile.TemporaryDirectory(prefix="ig_ytd_") as tmpdir:
+                        file_path, title, media_type = await asyncio.to_thread(_download_media_sync, url, tmpdir)
+                        size = os.path.getsize(file_path)
                         if size > MAX_FILESIZE_BYTES:
                             raise ValueError(f"Файл завеликий ({size // 1024 // 1024}MB). Ліміт {MAX_FILESIZE_MB}MB.")
-                        with open(filepath, "rb") as f:
+                        with open(file_path, "rb") as f:
                             if media_type == "video":
                                 await message.reply_video(video=f, supports_streaming=True)
-                            else:
+                            elif media_type == "photo":
                                 await message.reply_photo(photo=f)
+                            else:
+                                await message.reply_document(document=f)
                         try: await status_msg.delete()
                         except: pass
                         ig_handled = True
                 except Exception as e:
-                    logger.warning("instaloader fallback failed for url=%s: %s", url, e)
-                finally:
-                    if tmpdir_il:
-                        try: shutil.rmtree(tmpdir_il, ignore_errors=True)
-                        except: pass
+                    logger.warning("yt-dlp failed for Instagram url=%s: %s", url, e)
+
+            # Спроба 3: проксі (останній резерв — більшість мертві у 2026)
+            if not ig_handled:
+                logger.info("yt-dlp failed, trying proxies for Instagram URL: %s", url)
+                try:
+                    result = await asyncio.to_thread(_get_instagram_direct_media, url)
+                    if result:
+                        direct_url, media_type = result
+                        try:
+                            if media_type == "video":
+                                await message.reply_video(video=direct_url, supports_streaming=True)
+                            else:
+                                await message.reply_photo(photo=direct_url)
+                            try: await status_msg.delete()
+                            except: pass
+                            ig_handled = True
+                        except Exception as e:
+                            logger.warning(f"Proxy direct URL send failed, downloading file: {e}")
+                        if not ig_handled:
+                            with tempfile.TemporaryDirectory(prefix="ig_") as tmpdir:
+                                filepath = await asyncio.to_thread(_download_url_to_file, direct_url, tmpdir)
+                                size = os.path.getsize(filepath)
+                                if size > MAX_FILESIZE_BYTES:
+                                    raise ValueError(f"Файл завеликий ({size // 1024 // 1024}MB). Ліміт {MAX_FILESIZE_MB}MB.")
+                                with open(filepath, "rb") as f:
+                                    if media_type == "video":
+                                        await message.reply_video(video=f, supports_streaming=True)
+                                    else:
+                                        await message.reply_photo(photo=f)
+                                try: await status_msg.delete()
+                                except: pass
+                                ig_handled = True
+                except Exception as e:
+                    logger.warning("Proxy approach failed for url=%s: %s", url, e)
 
             if ig_handled:
                 return
 
-            # Спроба 4: yt-dlp fallback (останній шанс, потрібні cookies для IG)
-            logger.info("Falling back to yt-dlp for Instagram URL: %s", url)
+            # Всі методи провалились
+            await message.reply_text(
+                "❌ Не вдалося завантажити з Instagram. "
+                "Можливо пост закритий або потрібні cookies (YTDLP_COOKIES_B64)."
+            )
+            try: await status_msg.delete()
+            except: pass
+            return
 
-        # ── Стандартна логіка для інших сайтів (YouTube, TikTok, Instagram fallback, і т.д.) ──
+        # ── Стандартна логіка для інших сайтів (YouTube, TikTok і т.д.) ──
         try:
             with tempfile.TemporaryDirectory(prefix="dl_") as tmpdir:
                 try:
