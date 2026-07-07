@@ -7,6 +7,8 @@ services:
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
       - MAX_FILESIZE_MB=${MAX_FILESIZE_MB:-49}
+      - MAX_CONCURRENT_DOWNLOADS=${MAX_CONCURRENT_DOWNLOADS:-2}
+      - USER_COOLDOWN_SECONDS=${USER_COOLDOWN_SECONDS:-30}
       - YTDLP_FORMAT=${YTDLP_FORMAT:-best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best}
       - YTDLP_PROXY=${YTDLP_PROXY:-}
       - YTDLP_COOKIEFILE=${YTDLP_COOKIEFILE:-}

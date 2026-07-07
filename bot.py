@@ -4,7 +4,9 @@ import binascii
 import logging
 import os
 import re
+import shutil
 import tempfile
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Optional, Tuple
@@ -43,29 +45,13 @@ MAX_FILESIZE_MB = int(os.getenv("MAX_FILESIZE_MB", "49"))
 MAX_FILESIZE_BYTES = MAX_FILESIZE_MB * 1024 * 1024
 URL_REGEX = re.compile(r"(https?://\S+)", re.IGNORECASE)
 
-# Domains that Telegram can natively embed video via community proxies
-PROXY_DOMAINS = {
-    "instagram.com": "vxinstagram.com",
-    "www.instagram.com": "vxinstagram.com",
-    "tiktok.com": "vxtiktok.com",
-    "www.tiktok.com": "vxtiktok.com",
-    "vm.tiktok.com": "vm.vxtiktok.com",
-    "twitter.com": "fxtwitter.com",
-    "www.twitter.com": "fxtwitter.com",
-    "x.com": "fixvx.com",
-    "www.x.com": "fixvx.com",
-}
+# Ліміт одночасних завантажень (пам'ять/CPU на Railway)
+MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
+_download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-def _get_proxied_url(url: str) -> Optional[str]:
-    try:
-        parsed = urllib.parse.urlparse(url)
-        hostname = parsed.hostname.lower() if parsed.hostname else ""
-        if hostname in PROXY_DOMAINS:
-            new_hostname = PROXY_DOMAINS[hostname]
-            return urllib.parse.urlunparse(parsed._replace(netloc=new_hostname))
-    except Exception:
-        pass
-    return None
+# Cooldown на юзера (секунди) — анти-спам
+USER_COOLDOWN_SECONDS = int(os.getenv("USER_COOLDOWN_SECONDS", "30"))
+_user_last_download: dict = {}
 
 def _extract_url_from_message(update: Update) -> Optional[str]:
     message = update.effective_message
@@ -126,6 +112,7 @@ def _download_media_with_opts(url: str, tmpdir: str, format_opts: dict) -> Tuple
         "noplaylist": True,
         "retries": 3,
         "max_filesize": MAX_FILESIZE_BYTES,
+        "socket_timeout": 30,
         "quiet": True,
         "no_warnings": True,
         "postprocessors": [{
@@ -334,32 +321,68 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     url = _extract_url_from_message(update)
     if not url: return
 
+    # Anti-spam: cooldown на юзера
+    user_id = update.effective_user.id if update.effective_user else 0
+    now = time.monotonic()
+    last = _user_last_download.get(user_id, 0)
+    if now - last < USER_COOLDOWN_SECONDS:
+        remaining = int(USER_COOLDOWN_SECONDS - (now - last))
+        await message.reply_text(f"⏳ Зачекай {remaining}с перед наступним завантаженням.")
+        return
+    _user_last_download[user_id] = now
+
     status_msg = await message.reply_text("📥 Завантажую відео...")
 
-    # ── Спеціальна логіка для Instagram (проксі → instaloader → yt-dlp fallback) ──
-    if "instagram.com" in url:
-        ig_handled = False
-        try:
-            result = await asyncio.to_thread(_get_instagram_direct_media, url)
-            if result:
-                direct_url, media_type = result
+    async with _download_semaphore:
 
-                # Спроба 1: відправити по URL напряму (швидко, без скачування)
+        # ── Спеціальна логіка для Instagram (проксі → instaloader → yt-dlp fallback) ──
+        if "instagram.com" in url:
+            ig_handled = False
+            try:
+                result = await asyncio.to_thread(_get_instagram_direct_media, url)
+                if result:
+                    direct_url, media_type = result
+
+                    # Спроба 1: відправити по URL напряму (швидко, без скачування)
+                    try:
+                        if media_type == "video":
+                            await message.reply_video(video=direct_url, supports_streaming=True)
+                        else:
+                            await message.reply_photo(photo=direct_url)
+                        try: await status_msg.delete()
+                        except: pass
+                        ig_handled = True
+                    except Exception as e:
+                        logger.warning(f"Direct URL send failed, downloading file: {e}")
+
+                    # Спроба 2: скачуємо файл собі і потім відправляємо
+                    if not ig_handled:
+                        with tempfile.TemporaryDirectory(prefix="ig_") as tmpdir:
+                            filepath = await asyncio.to_thread(_download_url_to_file, direct_url, tmpdir)
+                            size = os.path.getsize(filepath)
+                            if size > MAX_FILESIZE_BYTES:
+                                raise ValueError(f"Файл завеликий ({size // 1024 // 1024}MB). Ліміт {MAX_FILESIZE_MB}MB.")
+                            with open(filepath, "rb") as f:
+                                if media_type == "video":
+                                    await message.reply_video(video=f, supports_streaming=True)
+                                else:
+                                    await message.reply_photo(photo=f)
+                            try: await status_msg.delete()
+                            except: pass
+                            ig_handled = True
+                else:
+                    logger.warning("All IG proxies returned no media, falling back to instaloader")
+            except Exception as e:
+                logger.warning("Instagram proxy approach failed for url=%s, falling back to instaloader: %s", url, e)
+
+            # Спроба 3: instaloader (надійніший за yt-dlp для Instagram)
+            if not ig_handled:
+                tmpdir_il = None
                 try:
-                    if media_type == "video":
-                        await message.reply_video(video=direct_url, supports_streaming=True)
-                    else:
-                        await message.reply_photo(photo=direct_url)
-                    try: await status_msg.delete()
-                    except: pass
-                    ig_handled = True
-                except Exception as e:
-                    logger.warning(f"Direct URL send failed, downloading file: {e}")
-
-                # Спроба 2: скачуємо файл собі і потім відправляємо
-                if not ig_handled:
-                    with tempfile.TemporaryDirectory(prefix="ig_") as tmpdir:
-                        filepath = await asyncio.to_thread(_download_url_to_file, direct_url, tmpdir)
+                    tmpdir_il = tempfile.mkdtemp(prefix="ig_il_")
+                    il_result = await asyncio.to_thread(_download_instagram_instaloader, url, tmpdir_il)
+                    if il_result:
+                        filepath, media_type = il_result
                         size = os.path.getsize(filepath)
                         if size > MAX_FILESIZE_BYTES:
                             raise ValueError(f"Файл завеликий ({size // 1024 // 1024}MB). Ліміт {MAX_FILESIZE_MB}MB.")
@@ -371,73 +394,48 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                         try: await status_msg.delete()
                         except: pass
                         ig_handled = True
-            else:
-                logger.warning("All IG proxies returned no media, falling back to instaloader")
+                except Exception as e:
+                    logger.warning("instaloader fallback failed for url=%s: %s", url, e)
+                finally:
+                    if tmpdir_il:
+                        try: shutil.rmtree(tmpdir_il, ignore_errors=True)
+                        except: pass
+
+            if ig_handled:
+                return
+
+            # Спроба 4: yt-dlp fallback (останній шанс, потрібні cookies для IG)
+            logger.info("Falling back to yt-dlp for Instagram URL: %s", url)
+
+        # ── Стандартна логіка для інших сайтів (YouTube, TikTok, Instagram fallback, і т.д.) ──
+        try:
+            with tempfile.TemporaryDirectory(prefix="dl_") as tmpdir:
+                try:
+                    file_path, title, media_type = await asyncio.to_thread(_download_media_sync, url, tmpdir)
+                except DownloadError as e:
+                    msg = str(e).lower()
+                    if "max-filesize" in msg:
+                        raise ValueError(f"Медіа занадто велике (ліміт {MAX_FILESIZE_MB}MB).") from e
+                    raise
+                size = os.path.getsize(file_path)
+                if size > MAX_FILESIZE_BYTES:
+                    raise ValueError(f"Медіа занадто велике. Ліміт {MAX_FILESIZE_MB}MB.")
+                caption = title[:1000] if title else None
+                with open(file_path, "rb") as f:
+                    if media_type == "video":
+                        await message.reply_video(video=f, caption=caption, supports_streaming=True)
+                    elif media_type == "photo":
+                        await message.reply_photo(photo=f, caption=caption)
+                    elif media_type == "audio":
+                        await message.reply_audio(audio=f, caption=caption)
+                    else:
+                        await message.reply_document(document=f, caption=caption)
         except Exception as e:
-            logger.warning("Instagram proxy approach failed for url=%s, falling back to instaloader: %s", url, e)
-
-        # Спроба 3: instaloader (надійніший за yt-dlp для Instagram)
-        if not ig_handled:
-            tmpdir_il = None
-            try:
-                tmpdir_il = tempfile.mkdtemp(prefix="ig_il_")
-                il_result = await asyncio.to_thread(_download_instagram_instaloader, url, tmpdir_il)
-                if il_result:
-                    filepath, media_type = il_result
-                    size = os.path.getsize(filepath)
-                    if size > MAX_FILESIZE_BYTES:
-                        raise ValueError(f"Файл завеликий ({size // 1024 // 1024}MB). Ліміт {MAX_FILESIZE_MB}MB.")
-                    with open(filepath, "rb") as f:
-                        if media_type == "video":
-                            await message.reply_video(video=f, supports_streaming=True)
-                        else:
-                            await message.reply_photo(photo=f)
-                    try: await status_msg.delete()
-                    except: pass
-                    ig_handled = True
-            except Exception as e:
-                logger.warning("instaloader fallback failed for url=%s: %s", url, e)
-            finally:
-                if tmpdir_il:
-                    import shutil
-                    try: shutil.rmtree(tmpdir_il, ignore_errors=True)
-                    except: pass
-
-        if ig_handled:
-            return
-
-        # Спроба 4: yt-dlp fallback (останній шанс, потрібні cookies для IG)
-        logger.info("Falling back to yt-dlp for Instagram URL: %s", url)
-
-    # ── Стандартна логіка для інших сайтів (YouTube, TikTok, Instagram fallback, і т.д.) ──
-    try:
-        with tempfile.TemporaryDirectory(prefix="dl_") as tmpdir:
-            try:
-                file_path, title, media_type = await asyncio.to_thread(_download_media_sync, url, tmpdir)
-            except DownloadError as e:
-                msg = str(e).lower()
-                if "max-filesize" in msg:
-                    raise ValueError(f"Медіа занадто велике (ліміт {MAX_FILESIZE_MB}MB).") from e
-                raise
-            size = os.path.getsize(file_path)
-            if size > MAX_FILESIZE_BYTES:
-                raise ValueError(f"Медіа занадто велике. Ліміт {MAX_FILESIZE_MB}MB.")
-            caption = title[:1000] if title else None
-            with open(file_path, "rb") as f:
-                if media_type == "video":
-                    await message.reply_video(video=f, caption=caption, supports_streaming=True)
-                elif media_type == "photo":
-                    await message.reply_photo(photo=f, caption=caption)
-                elif media_type == "audio":
-                    await message.reply_audio(audio=f, caption=caption)
-                else:
-                    await message.reply_document(document=f, caption=caption)
-    except Exception as e:
-        logger.exception("Failed to process url=%s", url)
-        await message.reply_text(f"❌ Сталася помилка: {e}")
-    finally:
-        try: await status_msg.delete()
-        except Exception: pass
+            logger.exception("Failed to process url=%s", url)
+            await message.reply_text(f"❌ Сталася помилка: {e}")
+        finally:
+            try: await status_msg.delete()
+            except Exception: pass
 
 def main() -> None:
     token = os.getenv("BOT_TOKEN")
