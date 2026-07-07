@@ -79,6 +79,18 @@ def _pick_downloaded_file(tmpdir: str) -> str:
     return str(best)
 
 def _download_media_sync(url: str, tmpdir: str) -> Tuple[str, str, str]:
+    is_youtube = "youtube.com" in url or "youtu.be" in url
+    is_tiktok = "tiktok.com" in url
+
+    # Специфічні extractor_args для YouTube (обхід "Sign in to confirm")
+    yt_extractor_args = None
+    if is_youtube:
+        yt_extractor_args = {
+            "youtube": {
+                "player_client": ["android", "web"],
+            },
+        }
+
     try:
         # 1. Гарантований запит на злиття відео та аудіо (виправлено проблему зі звуком)
         return _download_media_with_opts(url, tmpdir, {
@@ -86,19 +98,35 @@ def _download_media_sync(url: str, tmpdir: str) -> Tuple[str, str, str]:
                 "YTDLP_FORMAT",
                 "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
             ),
+            "extractor_args": yt_extractor_args,
         })
     except DownloadError as e:
         msg_l = str(e).lower()
+
+        # YouTube "Sign in to confirm" — пробуємо інші клієнти
+        if is_youtube and ("sign in" in msg_l or "not a bot" in msg_l or "no formats" in msg_l):
+            logger.warning("YouTube bot check triggered, trying alternative clients")
+            for client in [["ios"], ["mweb"], ["tv_embedded"]]:
+                try:
+                    return _download_media_with_opts(url, tmpdir, {
+                        "format": os.getenv("YTDLP_FORMAT", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"),
+                        "extractor_args": {"youtube": {"player_client": client}},
+                    })
+                except DownloadError:
+                    continue
+
         if "video" in msg_l and ("merge" in msg_l or "audio" in msg_l or "ffmpeg" in msg_l):
             try:
                 return _download_media_with_opts(url, tmpdir, {
                     "format": "bestaudio[ext=m4a]/bestaudio/best",
+                    "extractor_args": yt_extractor_args,
                 })
             except DownloadError:
                 pass
         try:
             return _download_media_with_opts(url, tmpdir, {
                 "format": "worst/worst[ext=mp4]/worst",
+                "extractor_args": yt_extractor_args,
             })
         except DownloadError:
             pass
@@ -122,6 +150,8 @@ def _download_media_with_opts(url: str, tmpdir: str, format_opts: dict) -> Tuple
         "embed_subs": False,
         "writesubtitles": False,
     }
+    if format_opts.get("extractor_args"):
+        ydl_opts["extractor_args"] = format_opts["extractor_args"]
     proxy = os.getenv("YTDLP_PROXY")
     if proxy:
         ydl_opts["proxy"] = proxy
@@ -479,6 +509,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                         await message.reply_audio(audio=f, caption=caption)
                     else:
                         await message.reply_document(document=f, caption=caption)
+        except DownloadError as e:
+            msg_l = str(e).lower()
+            if "sign in" in msg_l or "not a bot" in msg_l:
+                await message.reply_text(
+                    "❌ YouTube вимагає верифікацію. Потрібні cookies.\n"
+                    "Додай YTDLP_COOKIES_B64 env var з cookies.txt у base64.\n"
+                    "Інструкція: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies"
+                )
+            elif "max-filesize" in msg_l:
+                await message.reply_text(f"❌ Медіа занадто велике (ліміт {MAX_FILESIZE_MB}MB).")
+            else:
+                logger.exception("Failed to process url=%s", url)
+                await message.reply_text(f"❌ Помилка завантаження: {e}")
         except Exception as e:
             logger.exception("Failed to process url=%s", url)
             await message.reply_text(f"❌ Сталася помилка: {e}")
