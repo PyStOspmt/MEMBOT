@@ -12,7 +12,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install bgutil PO Token provider (auto-generates YouTube PO Tokens without cookies)
-RUN npm install -g bgutil-ytdlp-pot-provider
+RUN npm install -g https://github.com/nicedayzhu/bgutil-ytdlp-pot-provider/releases/latest/download/bgutil-ytdlp-pot-provider.tgz
 
 COPY . ./
 
